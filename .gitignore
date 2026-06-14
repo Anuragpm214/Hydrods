@@ -1,0 +1,22 @@
+# Build artifacts
+hydrodb_server
+*.o
+*.out
+
+# Python SDK / Virtual Environment
+venv/
+__pycache__/
+*.pyc
+hydrods.egg-info/
+dist/
+
+# Database Persistence and Logs
+*.aof
+*.aof.bak
+*.rdb
+*.log
+
+# IDEs
+.vscode/
+.idea/
+*.swp
