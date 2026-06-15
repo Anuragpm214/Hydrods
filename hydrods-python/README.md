@@ -1,8 +1,8 @@
 # HydroDB Python Client (`hydrods`)
 
-The official Python client library for **HydroDB** - a blazing fast, multi-threaded, sharded NoSQL database built in C++. 
+The official Python client library for **HydroDB** - a blazing fast, multi-threaded NoSQL database built in C++17. 
 
-HydroDB is designed to outperform single-threaded databases like Redis in highly concurrent environments by utilizing 64-way Sharded Locks and Zero-Latency Asynchronous AOF Persistence.
+HydroDB is designed to outperform single-threaded databases like Redis in highly concurrent environments by utilizing a unified **Reader-Writer Starvation-Free Lock Engine**, dynamic **Fluid Pressure Buckets**, and Zero-Latency Asynchronous AOF Persistence.
 
 ## 🚀 Installation
 
@@ -30,7 +30,7 @@ print(f"Name: {name}")
 # DELETE a key
 db.delete('user:101')
 
-# --- Range Queries (SkipList / Ordered Keys) ---
+# --- Range Queries (Ordered Keys) ---
 
 # Fetch all keys between 'a' and 'z'
 all_data = db.range('a', 'z')
@@ -41,14 +41,14 @@ db.close()
 ```
 
 ## ⚡ Features
-- **Raw TCP Sockets:** No overhead, blazing fast native TCP connections.
+- **Raw TCP Sockets:** No overhead, blazing fast native TCP connections without blocking bugs.
 - **RESP Protocol Parser:** Automatically parses Redis Serialization Protocol responses directly into Python data structures (Strings, Integers, Dictionaries).
-- **Thread-safe Design:** Easily handles high concurrency when paired with Python's `threading` or connection pools.
+- **Thread Pool Compatible:** Easily handles high concurrency when paired with Python's `threading` or connection pools.
 
 ## 🏆 Performance
-In direct concurrent benchmarks (100,000 Operations, 100 Clients), HydroDB combined with `hydrods` achieves:
-- **1.8x Faster Writes** than Redis.
-- **3x Faster Parallel Reads** leveraging C++ `std::shared_mutex`.
+In direct concurrent benchmarks against standard Redis Event-Loop:
+- **Faster Single-Threaded Reads:** `~26,000 GET RPS` natively without async-loop overhead.
+- **Extreme Concurrency:** Maintains highly stable `40,000+ RPS` even with 200+ concurrent worker threads constantly reading and writing, thanks to robust `std::shared_mutex` usage and lock-free thread queues.
 
 ## License
 MIT License
