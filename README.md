@@ -1,83 +1,98 @@
-# 🌊 HydroDB
+<div align="center">
+  <h1>🌊 HydroDB</h1>
+  <p><strong>An Ultra-Fast, Uncompressed Time-Series Module for Redis</strong></p>
+  <p><i>Trading memory density for absolute, uncompromised CPU speed.</i></p>
+</div>
 
-![C++](https://img.shields.io/badge/C++-17-blue.svg) ![Multithreaded](https://img.shields.io/badge/Concurrency-Multi--threaded-success.svg) ![Redis Compatible](https://img.shields.io/badge/Protocol-RESP-red.svg)
+---
 
-HydroDB is a high-performance, multi-threaded, in-memory NoSQL database written entirely in C++17. It features a unique cache-friendly B-Tree/Unrolled Linked List hybrid data structure (**Dynamic Buckets with Fluid Pressure**) designed for blazing-fast lookups, range queries, and highly concurrent workloads.
+## 📌 What is HydroDB?
 
-By natively speaking the **Redis Serialization Protocol (RESP)**, HydroDB functions as a drop-in, multi-core alternative to Redis.
+HydroDB is a custom native Redis Module designed for specific Time-Series use cases where **query speed** is prioritized over **memory footprint**. 
 
-## ✨ Features
-* **100% Thread-Safe & Concurrent:** Uses global Read-Write locks (`std::shared_mutex`) with a custom starvation-prevention algorithm to handle 40,000+ operations/sec under extreme concurrency.
-* **Redis Compatible:** Speaks the standard RESP protocol. You can use standard `redis-cli` or any Redis Python/Node.js client to talk to it.
-* **Fluid Data Structure:** Dynamically balances data between memory buckets using a "fluid pressure" stabilization algorithm, completely bypassing expensive tree-rebalancing.
-* **Async Disk Persistence:** Every write is asynchronously pushed to an Append Only File (`hydrodb.aof`) via a dedicated background thread, ensuring zero-latency writes with full crash recovery.
-* **Epoll Event Loop / Redis Native:** Originally a standalone C++ non-blocking `epoll` server, HydroDB is now ported into a pure C Redis Module (`hydrodb.so`), inherently benefiting from Redis's world-class single-threaded asynchronous I/O to manage thousands of clients.
+While the official `RedisTimeSeries` module uses Gorilla Compression to pack data incredibly tightly into memory (resulting in slower `O(N)` decompression overhead during queries), **HydroDB stores data completely uncompressed** in "Fluid Buckets" (a hybrid of B-Trees and Unrolled Linked Lists). 
 
-## 🚀 Performance
-Benchmarked against standard Redis using a 64-byte payload for 200,000 queries:
-* **Single Threaded GET:** ~25,997 RPS *(Faster than Redis!)*
-* **Extreme Concurrency (200 Threads):** ~40,000 RPS *(Highly competitive with Redis Event-Loop).*
-* **Range Queries (`ZRANGE`):** Blazing fast lexicographical searches *(~355 microseconds for 10-key ranges).*
+### ⚖️ The Honest Trade-Off
 
-## 🛠️ Building & Running
+We believe in engineering transparency. HydroDB is not a magic bullet that beats RedisTimeSeries in every aspect. 
 
-### Requirements
-* C++17 Compiler (GCC/Clang)
-* `make`
+* **The Cost (RAM):** HydroDB consumes **~8x to 10x more RAM** than RedisTimeSeries. A 16-byte fixed struct (`uint64_t timestamp`, `double value`) is stored for every data point.
+* **The Benefit (Speed):** By keeping data uncompressed in contiguous arrays, HydroDB can perform exact-boundary matching and aggregations in `O(log N)` time. Internally, this algorithmic approach executes up to **250x faster** than sequentially decompressing Gorilla chunks.
 
-### Build
+If you have abundant RAM and need instantaneous aggregation queries on massive ranges, HydroDB is built for you.
+
+---
+
+## ⚡ Architecture Overview
+
+1. **Pure C Engine**: The core engine (`hydrods_engine.c`) is written in highly-optimized C, bypassing C++ runtime overhead. It leverages `malloc`/`realloc` and POSIX `memmove` to maintain sorted continuous arrays efficiently.
+2. **Instant Aggregations**: Mathematical operations (Count, Sum, Min, Max) are executed instantly in RAM over ranges.
+3. **Data Durability**: Fully supports Redis native persistence. Data is persisted via RDB Snapshotting and AOF (Append-Only File) rewriting natively.
+
+---
+
+## 🛠️ Build & Installation
+
+To compile the module from source:
+
 ```bash
-make clean
-make
+git clone https://github.com/yourusername/hydrodb.git
+cd hydrodb/hydro_module
+make clean && make
 ```
 
-### Run Server
+Load it into your Redis Server (v6.0+):
+
 ```bash
-./hydrodb_server
-```
-The server will start listening on port `7379`.
-
-## 💻 Usage (Redis CLI)
-Since HydroDB speaks RESP, simply use `redis-cli` targeting port `7379`:
-```bash
-redis-cli -p 7379
-127.0.0.1:7379> SET user:1 "John Doe"
-OK
-127.0.0.1:7379> GET user:1
-"John Doe"
-127.0.0.1:7379> ZADD leaderboard 0 player_1
-1
-127.0.0.1:7379> ZRANGE leaderboard:a leaderboard:z
-1) "leaderboard"
-2) "player_1"
+redis-server --loadmodule ./hydro_module/hydrodb.so
 ```
 
-### Supported Commands
-* `SET key value` - Store a key-value pair.
-* `GET key` - Retrieve a value by key.
-* `DEL key` - Delete a key.
-* `ZADD key score member` - Alias for `SET key:score member` for lexicographical sorting.
-* `ZRANGE start end [LIMIT offset count]` - Lexicographical range query.
-* `PING` - Health check.
-* `HELLO` - RESP3 compatibility acknowledgement.
+---
 
-## 🐍 Python SDK (`hydrods`)
-HydroDB comes with its own lightweight Python SDK for direct TCP communication bypassing standard Redis client overheads.
-```python
-import sys
-sys.path.append('./hydrods-python')
-from hydrods import HydroDB
+## 📖 Command Reference
 
-# Connect
-db = HydroDB('127.0.0.1', 7379)
+### `HY.ADD`
+Inserts a single data point into the time series.
+* **Syntax:** `HY.ADD <key> <timestamp> <value>`
+* **Example:** `HY.ADD CPU_TEMP 1700000000 65.5`
 
-db.set("my_key", "my_value")
-print(db.get("my_key"))
+### `HY.MADD`
+Atomically inserts multiple data points, heavily reducing TCP latency and parsing overhead.
+* **Syntax:** `HY.MADD <key> <timestamp1> <value1> [timestamp2 value2 ...]`
+* **Example:** `HY.MADD CPU_TEMP 1700000000 65.5 1700000060 66.1`
 
-# Fast Range Query returning dictionary
-results = db.range("a", "z") 
-print(results)
-```
+### `HY.RANGE`
+Queries a time range and optionally aggregates the result in `O(log N)` algorithmic time.
+* **Syntax:** `HY.RANGE <key> <start_timestamp> <end_timestamp> [AGGREGATION count|sum|min|max]`
+* **Examples:**
+  * `HY.RANGE CPU_TEMP 1700000000 1700003600` *(Returns raw element count by default)*
+  * `HY.RANGE CPU_TEMP 1700000000 1700003600 AGGREGATION sum`
+  * `HY.RANGE CPU_TEMP 1700000000 1700003600 AGGREGATION min`
 
-## 📚 Architecture details
-For a deep dive into the Fluid Pressure Buckets, Reader-Writer starvation prevention, and Thread Pool architecture, please read the [Architecture Documentation](HYDRODB_ARCHITECTURE.md).
+### `HY.BENCH` (Internal Testing)
+An internal benchmarking command used to test raw algorithm CPU execution time independently of the TCP/RESP stack.
+* **Syntax:** `HY.BENCH <key> <start_timestamp> <range_duration_seconds> <queries>`
+
+---
+
+## 📊 Performance Benchmarks
+
+When tested over a standard TCP connection using a Python client pipelining **1 Million data points**, here is how HydroDB compares to the official RedisTimeSeries:
+
+| Test Phase (1M Pts over TCP) | Redis TimeSeries | HydroDB | Result |
+| :--- | :--- | :--- | :--- |
+| **Ingestion** (1M TCP inserts) | `11.4 s` | `11.9 s` | *Gated by TCP/RESP limits* |
+| **Small Range** (1440 pts x 500) | `153 ms` | `97 ms` | 🚀 **1.5x Faster** |
+| **Medium Range** (43k pts x 500)| `510 ms` | `145 ms` | 🚀 **3.5x Faster** |
+| **Large Range** (100k pts x 150)| `255 ms` | `55 ms` | 🚀 **4.6x Faster** |
+
+> **Amdahl's Law in Action:** Over the network, the maximum achievable speedup is heavily bottlenecked by standard TCP connection latency and Redis's RESP string-parsing overhead (adding ~143ms to both module's query times). However, when isolating the core CPU algorithms via internal benchmarking, the HydroDB C-algorithm executes up to **250x faster** than Gorilla-compressed reads.
+
+---
+
+## 🤝 Contributing
+Contributions are extremely welcome! We are looking to implement:
+- Range Extraction (returning actual arrays of values instead of just aggregations).
+- Retention Policies (TTL-based data culling).
+
+Feel free to open an issue or submit a pull request!
