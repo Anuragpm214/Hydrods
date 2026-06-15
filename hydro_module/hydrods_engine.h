@@ -3,7 +3,25 @@
 
 #include <stdint.h>
 #include <stddef.h>
+
+/*
+ * Configurable Memory Allocator
+ * When compiled as a Redis Module (-DREDIS_MODULE), all allocations go through
+ * RedisModule_Alloc so that Redis can track memory usage via INFO, enforce
+ * maxmemory policies, and trigger OOM handling correctly.
+ * When compiled standalone, falls back to standard libc malloc/realloc/free.
+ */
+#ifdef REDIS_MODULE
+#include "redismodule.h"
+#define hydro_malloc(sz)        RedisModule_Alloc(sz)
+#define hydro_realloc(ptr, sz)  RedisModule_Realloc(ptr, sz)
+#define hydro_free(ptr)         RedisModule_Free(ptr)
+#else
 #include <stdlib.h>
+#define hydro_malloc(sz)        malloc(sz)
+#define hydro_realloc(ptr, sz)  realloc(ptr, sz)
+#define hydro_free(ptr)         free(ptr)
+#endif
 
 // Represents a single 16-byte data point
 typedef struct {
@@ -39,7 +57,7 @@ typedef struct {
 
 hydro_ds* hydrods_create(int bucket_capacity_limit);
 void hydrods_free(hydro_ds *ds);
-void hydrods_insert(hydro_ds *ds, uint64_t timestamp, double value);
+int hydrods_insert(hydro_ds *ds, uint64_t timestamp, double value);  /* Returns 0 on success, -1 on allocation failure */
 size_t hydrods_range_query(hydro_ds *ds, uint64_t start_ts, uint64_t end_ts, hydro_ts_node **out_arr);
 hydro_agg_result hydrods_range_aggregate(hydro_ds *ds, uint64_t start_ts, uint64_t end_ts);
 

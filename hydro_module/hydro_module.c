@@ -13,17 +13,24 @@ void HydroTypeFree(void *value) {
 }
 
 void *HydroTypeRdbLoad(RedisModuleIO *rdb, int encver) {
-    REDISMODULE_NOT_USED(encver);
+    if (encver != 0) {
+        RedisModule_LogIOError(rdb, "warning", "Unsupported HydroDB encoding version %d", encver);
+        return NULL;
+    }
     
     uint64_t bucket_capacity_limit = RedisModule_LoadUnsigned(rdb);
     uint64_t total_elements = RedisModule_LoadUnsigned(rdb);
     
     hydro_ds *ds = hydrods_create((int)bucket_capacity_limit);
+    if (!ds) return NULL;
     
     for (uint64_t i = 0; i < total_elements; i++) {
         uint64_t ts = RedisModule_LoadUnsigned(rdb);
         double val = RedisModule_LoadDouble(rdb);
-        hydrods_insert(ds, ts, val);
+        if (hydrods_insert(ds, ts, val) != 0) {
+            hydrods_free(ds);
+            return NULL;
+        }
     }
     
     return ds;
@@ -79,6 +86,9 @@ int HyAdd_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
     if (RedisModule_StringToLongLong(argv[2], &ts) != REDISMODULE_OK) {
         return RedisModule_ReplyWithError(ctx, "ERR invalid timestamp");
     }
+    if (ts < 0) {
+        return RedisModule_ReplyWithError(ctx, "ERR timestamp must be non-negative");
+    }
     if (RedisModule_StringToDouble(argv[3], &val) != REDISMODULE_OK) {
         return RedisModule_ReplyWithError(ctx, "ERR invalid value");
     }
@@ -93,15 +103,22 @@ int HyAdd_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
     hydro_ds *ds;
     if (type == REDISMODULE_KEYTYPE_EMPTY) {
         ds = hydrods_create(1000);
+        if (!ds) {
+            RedisModule_CloseKey(key);
+            return RedisModule_ReplyWithError(ctx, "ERR out of memory");
+        }
         RedisModule_ModuleTypeSetValue(key, HydroType, ds);
     } else {
         ds = RedisModule_ModuleTypeGetValue(key);
     }
 
-    hydrods_insert(ds, (uint64_t)ts, val);
+    if (hydrods_insert(ds, (uint64_t)ts, val) != 0) {
+        RedisModule_CloseKey(key);
+        return RedisModule_ReplyWithError(ctx, "ERR out of memory during insert");
+    }
     RedisModule_CloseKey(key);
     
-    // Also send standard Redis notification for key update if needed.
+    RedisModule_ReplicateVerbatim(ctx);
     return RedisModule_ReplyWithSimpleString(ctx, "OK");
 }
 
@@ -109,6 +126,20 @@ int HyAdd_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
 int HyMAdd_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     if (argc < 4 || argc % 2 != 0) return RedisModule_WrongArity(ctx);
     
+    /* Pre-validate ALL arguments before modifying any data */
+    for (int i = 2; i < argc; i += 2) {
+        long long ts; double val;
+        if (RedisModule_StringToLongLong(argv[i], &ts) != REDISMODULE_OK) {
+            return RedisModule_ReplyWithError(ctx, "ERR invalid timestamp in MADD arguments");
+        }
+        if (ts < 0) {
+            return RedisModule_ReplyWithError(ctx, "ERR timestamp must be non-negative");
+        }
+        if (RedisModule_StringToDouble(argv[i+1], &val) != REDISMODULE_OK) {
+            return RedisModule_ReplyWithError(ctx, "ERR invalid value in MADD arguments");
+        }
+    }
+
     RedisModuleKey *key = RedisModule_OpenKey(ctx, argv[1], REDISMODULE_READ | REDISMODULE_WRITE);
     int type = RedisModule_KeyType(key);
     if (type != REDISMODULE_KEYTYPE_EMPTY && RedisModule_ModuleTypeGetType(key) != HydroType) {
@@ -119,6 +150,10 @@ int HyMAdd_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc)
     hydro_ds *ds;
     if (type == REDISMODULE_KEYTYPE_EMPTY) {
         ds = hydrods_create(1000);
+        if (!ds) {
+            RedisModule_CloseKey(key);
+            return RedisModule_ReplyWithError(ctx, "ERR out of memory");
+        }
         RedisModule_ModuleTypeSetValue(key, HydroType, ds);
     } else {
         ds = RedisModule_ModuleTypeGetValue(key);
@@ -127,14 +162,17 @@ int HyMAdd_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc)
     long long inserted = 0;
     for (int i = 2; i < argc; i += 2) {
         long long ts; double val;
-        if (RedisModule_StringToLongLong(argv[i], &ts) == REDISMODULE_OK &&
-            RedisModule_StringToDouble(argv[i+1], &val) == REDISMODULE_OK) {
-            hydrods_insert(ds, (uint64_t)ts, val);
-            inserted++;
+        RedisModule_StringToLongLong(argv[i], &ts);
+        RedisModule_StringToDouble(argv[i+1], &val);
+        if (hydrods_insert(ds, (uint64_t)ts, val) != 0) {
+            RedisModule_CloseKey(key);
+            return RedisModule_ReplyWithError(ctx, "ERR out of memory during bulk insert");
         }
+        inserted++;
     }
     
     RedisModule_CloseKey(key);
+    RedisModule_ReplicateVerbatim(ctx);
     return RedisModule_ReplyWithLongLong(ctx, inserted);
 }
 
@@ -146,6 +184,9 @@ int HyRange_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc
     if (RedisModule_StringToLongLong(argv[2], &start_ts) != REDISMODULE_OK ||
         RedisModule_StringToLongLong(argv[3], &end_ts) != REDISMODULE_OK) {
         return RedisModule_ReplyWithError(ctx, "ERR invalid range");
+    }
+    if (start_ts < 0 || end_ts < 0) {
+        return RedisModule_ReplyWithError(ctx, "ERR range timestamps must be non-negative");
     }
 
     const char *agg_type = "count"; // Default
@@ -180,6 +221,7 @@ int HyRange_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc
 }
 
 // HY.BENCHMARK key start_ts range_size queries
+// NOTE: This command is for internal testing only. Consider disabling in production builds.
 #include <sys/time.h>
 int HyBench_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     if (argc != 5) return RedisModule_WrongArity(ctx);

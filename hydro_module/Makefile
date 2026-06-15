@@ -1,5 +1,5 @@
 CC=gcc
-CFLAGS=-O3 -Wall -Wextra -fPIC
+CFLAGS=-O3 -Wall -Wextra -fPIC -DREDIS_MODULE
 
 all: hydrodb.so
 

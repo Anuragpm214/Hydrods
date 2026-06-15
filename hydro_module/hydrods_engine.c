@@ -6,30 +6,40 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 hydro_bucket* create_bucket(int capacity) {
-    hydro_bucket *b = (hydro_bucket*)malloc(sizeof(hydro_bucket));
+    hydro_bucket *b = (hydro_bucket*)hydro_malloc(sizeof(hydro_bucket));
+    if (!b) return NULL;
     b->capacity = capacity;
     b->size = 0;
-    b->data = (hydro_ts_node*)malloc(sizeof(hydro_ts_node) * capacity);
+    b->data = (hydro_ts_node*)hydro_malloc(sizeof(hydro_ts_node) * capacity);
+    if (!b->data) {
+        hydro_free(b);
+        return NULL;
+    }
     b->max_ts = 0;
     return b;
 }
 
 void free_bucket(hydro_bucket *b) {
     if (b) {
-        free(b->data);
-        free(b);
+        hydro_free(b->data);
+        hydro_free(b);
     }
 }
 
 hydro_ds* hydrods_create(int bucket_capacity_limit) {
-    hydro_ds *ds = (hydro_ds*)malloc(sizeof(hydro_ds));
+    hydro_ds *ds = (hydro_ds*)hydro_malloc(sizeof(hydro_ds));
+    if (!ds) return NULL;
     ds->bucket_capacity_limit = bucket_capacity_limit;
     ds->capacity = 4;
     ds->num_buckets = 0;
     ds->total_elements = 0;
     ds->eps_low = 0.50;
     ds->eps_high = 0.85;
-    ds->buckets = (hydro_bucket**)malloc(sizeof(hydro_bucket*) * ds->capacity);
+    ds->buckets = (hydro_bucket**)hydro_malloc(sizeof(hydro_bucket*) * ds->capacity);
+    if (!ds->buckets) {
+        hydro_free(ds);
+        return NULL;
+    }
     return ds;
 }
 
@@ -38,8 +48,8 @@ void hydrods_free(hydro_ds *ds) {
     for (int i = 0; i < ds->num_buckets; i++) {
         free_bucket(ds->buckets[i]);
     }
-    free(ds->buckets);
-    free(ds);
+    hydro_free(ds->buckets);
+    hydro_free(ds);
 }
 
 static inline double get_pressure(hydro_ds *ds, int idx) {
@@ -68,9 +78,9 @@ static int find_bucket(hydro_ds *ds, uint64_t ts) {
     return l;
 }
 
-static void flow(hydro_ds *ds, int i, int j) {
+static int flow(hydro_ds *ds, int i, int j) {
     double dp = get_pressure(ds, i) - get_pressure(ds, j);
-    if (dp <= ds->eps_high) return;
+    if (dp <= ds->eps_high) return 0;
 
     int k = (int)(ds->bucket_capacity_limit * (dp - ds->eps_low) / 2.0);
     if (k < 1) k = 1;
@@ -81,9 +91,12 @@ static void flow(hydro_ds *ds, int i, int j) {
 
     // Ensure B has capacity
     if (B->size + k > B->capacity) {
-        B->capacity *= 2;
-        if (B->capacity < B->size + k) B->capacity = B->size + k;
-        B->data = (hydro_ts_node*)realloc(B->data, sizeof(hydro_ts_node) * B->capacity);
+        int new_cap = B->capacity * 2;
+        if (new_cap < B->size + k) new_cap = B->size + k;
+        hydro_ts_node *new_data = (hydro_ts_node*)hydro_realloc(B->data, sizeof(hydro_ts_node) * new_cap);
+        if (!new_data) return -1;
+        B->data = new_data;
+        B->capacity = new_cap;
     }
 
     if (i < j) {
@@ -102,6 +115,7 @@ static void flow(hydro_ds *ds, int i, int j) {
 
     update_index(A);
     update_index(B);
+    return 0;
 }
 
 static void stabilize(hydro_ds *ds, int idx) {
@@ -128,10 +142,13 @@ static void stabilize(hydro_ds *ds, int idx) {
     }
 }
 
-static void split_bucket(hydro_ds *ds, int idx) {
+static int split_bucket(hydro_ds *ds, int idx) {
     if (ds->num_buckets == ds->capacity) {
-        ds->capacity *= 2;
-        ds->buckets = (hydro_bucket**)realloc(ds->buckets, sizeof(hydro_bucket*) * ds->capacity);
+        int new_cap = ds->capacity * 2;
+        hydro_bucket **new_buckets = (hydro_bucket**)hydro_realloc(ds->buckets, sizeof(hydro_bucket*) * new_cap);
+        if (!new_buckets) return -1;
+        ds->buckets = new_buckets;
+        ds->capacity = new_cap;
     }
 
     hydro_bucket *B = ds->buckets[idx];
@@ -139,9 +156,15 @@ static void split_bucket(hydro_ds *ds, int idx) {
     int move_count = B->size - mid;
 
     hydro_bucket *new_b = create_bucket(ds->bucket_capacity_limit);
+    if (!new_b) return -1;
     if (move_count > new_b->capacity) {
+        hydro_ts_node *new_data = (hydro_ts_node*)hydro_realloc(new_b->data, sizeof(hydro_ts_node) * move_count);
+        if (!new_data) {
+            free_bucket(new_b);
+            return -1;
+        }
+        new_b->data = new_data;
         new_b->capacity = move_count;
-        new_b->data = (hydro_ts_node*)realloc(new_b->data, sizeof(hydro_ts_node) * new_b->capacity);
     }
 
     memcpy(new_b->data, &B->data[mid], sizeof(hydro_ts_node) * move_count);
@@ -154,18 +177,21 @@ static void split_bucket(hydro_ds *ds, int idx) {
 
     update_index(B);
     update_index(new_b);
+    return 0;
 }
 
-void hydrods_insert(hydro_ds *ds, uint64_t ts, double val) {
+int hydrods_insert(hydro_ds *ds, uint64_t ts, double val) {
     if (ds->num_buckets == 0) {
-        ds->buckets[0] = create_bucket(ds->bucket_capacity_limit);
+        hydro_bucket *first = create_bucket(ds->bucket_capacity_limit);
+        if (!first) return -1;
+        ds->buckets[0] = first;
         ds->buckets[0]->data[0].timestamp = ts;
         ds->buckets[0]->data[0].value = val;
         ds->buckets[0]->size = 1;
         ds->num_buckets = 1;
         ds->total_elements = 1;
         update_index(ds->buckets[0]);
-        return;
+        return 0;
     }
 
     int b_idx = find_bucket(ds, ts);
@@ -185,8 +211,11 @@ void hydrods_insert(hydro_ds *ds, uint64_t ts, double val) {
     }
 
     if (B->size == B->capacity) {
-        B->capacity *= 2;
-        B->data = (hydro_ts_node*)realloc(B->data, sizeof(hydro_ts_node) * B->capacity);
+        int new_cap = B->capacity * 2;
+        hydro_ts_node *new_data = (hydro_ts_node*)hydro_realloc(B->data, sizeof(hydro_ts_node) * new_cap);
+        if (!new_data) return -1;
+        B->data = new_data;
+        B->capacity = new_cap;
     }
 
     if (insert_idx < B->size) {
@@ -201,10 +230,11 @@ void hydrods_insert(hydro_ds *ds, uint64_t ts, double val) {
     update_index(B);
 
     if (B->size > ds->bucket_capacity_limit) {
-        split_bucket(ds, b_idx);
+        if (split_bucket(ds, b_idx) != 0) return -1;
     }
 
     stabilize(ds, b_idx);
+    return 0;
 }
 
 // O(log N) binary search for lower bound
@@ -245,9 +275,6 @@ size_t hydrods_range_query(hydro_ds *ds, uint64_t start_ts, uint64_t end_ts, hyd
 
     int b_idx = find_bucket(ds, start_ts);
     size_t count = 0;
-    
-    // In a real module, out_arr would be a list of pointers to memory blocks to avoid memcpy.
-    // For now, we just count them. 
     
     for (int i = b_idx; i < ds->num_buckets; ++i) {
         hydro_bucket *B = ds->buckets[i];
