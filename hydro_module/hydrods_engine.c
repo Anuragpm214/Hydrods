@@ -26,7 +26,7 @@ void free_bucket(hydro_bucket *b) {
     }
 }
 
-hydro_ds* hydrods_create(int bucket_capacity_limit) {
+hydro_ds* hydrods_create(int bucket_capacity_limit, uint64_t retention_ms) {
     hydro_ds *ds = (hydro_ds*)hydro_malloc(sizeof(hydro_ds));
     if (!ds) return NULL;
     ds->bucket_capacity_limit = bucket_capacity_limit;
@@ -35,6 +35,7 @@ hydro_ds* hydrods_create(int bucket_capacity_limit) {
     ds->total_elements = 0;
     ds->eps_low = 0.50;
     ds->eps_high = 0.85;
+    ds->retention_ms = retention_ms;
     ds->buckets = (hydro_bucket**)hydro_malloc(sizeof(hydro_bucket*) * ds->capacity);
     if (!ds->buckets) {
         hydro_free(ds);
@@ -180,6 +181,36 @@ static int split_bucket(hydro_ds *ds, int idx) {
     return 0;
 }
 
+void hydrods_enforce_retention(hydro_ds *ds, uint64_t current_ts) {
+    if (ds->retention_ms == 0 || ds->num_buckets == 0) return;
+    
+    uint64_t cutoff_ts = 0;
+    if (current_ts > ds->retention_ms) {
+        cutoff_ts = current_ts - ds->retention_ms;
+    }
+    
+    int drop_count = 0;
+    size_t dropped_elements = 0;
+    
+    for (int i = 0; i < ds->num_buckets; i++) {
+        if (ds->buckets[i]->size > 0 && ds->buckets[i]->max_ts < cutoff_ts) {
+            dropped_elements += ds->buckets[i]->size;
+            free_bucket(ds->buckets[i]);
+            drop_count++;
+        } else {
+            break; // Stop at first non-dropped bucket because they are sorted
+        }
+    }
+    
+    if (drop_count > 0) {
+        ds->num_buckets -= drop_count;
+        ds->total_elements -= dropped_elements;
+        if (ds->num_buckets > 0) {
+            memmove(&ds->buckets[0], &ds->buckets[drop_count], sizeof(hydro_bucket*) * ds->num_buckets);
+        }
+    }
+}
+
 int hydrods_insert(hydro_ds *ds, uint64_t ts, double val) {
     if (ds->num_buckets == 0) {
         hydro_bucket *first = create_bucket(ds->bucket_capacity_limit);
@@ -234,6 +265,7 @@ int hydrods_insert(hydro_ds *ds, uint64_t ts, double val) {
     }
 
     stabilize(ds, b_idx);
+    hydrods_enforce_retention(ds, ts);
     return 0;
 }
 

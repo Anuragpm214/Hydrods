@@ -13,7 +13,7 @@ void HydroTypeFree(void *value) {
 }
 
 void *HydroTypeRdbLoad(RedisModuleIO *rdb, int encver) {
-    if (encver != 0) {
+    if (encver != 0 && encver != 1) {
         RedisModule_LogIOError(rdb, "warning", "Unsupported HydroDB encoding version %d", encver);
         return NULL;
     }
@@ -21,7 +21,12 @@ void *HydroTypeRdbLoad(RedisModuleIO *rdb, int encver) {
     uint64_t bucket_capacity_limit = RedisModule_LoadUnsigned(rdb);
     uint64_t total_elements = RedisModule_LoadUnsigned(rdb);
     
-    hydro_ds *ds = hydrods_create((int)bucket_capacity_limit);
+    uint64_t retention_ms = 0;
+    if (encver >= 1) {
+        retention_ms = RedisModule_LoadUnsigned(rdb);
+    }
+    
+    hydro_ds *ds = hydrods_create((int)bucket_capacity_limit, retention_ms);
     if (!ds) return NULL;
     
     for (uint64_t i = 0; i < total_elements; i++) {
@@ -41,6 +46,7 @@ void HydroTypeRdbSave(RedisModuleIO *rdb, void *value) {
     
     RedisModule_SaveUnsigned(rdb, ds->bucket_capacity_limit);
     RedisModule_SaveUnsigned(rdb, ds->total_elements);
+    RedisModule_SaveUnsigned(rdb, ds->retention_ms);
     
     for (int i = 0; i < ds->num_buckets; i++) {
         hydro_bucket *b = ds->buckets[i];
@@ -77,9 +83,9 @@ size_t HydroTypeMemUsage(const void *value) {
 
 // --- Commands ---
 
-// HY.ADD key timestamp value
+// HY.ADD key timestamp value [RETENTION ms]
 int HyAdd_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
-    if (argc != 4) return RedisModule_WrongArity(ctx);
+    if (argc != 4 && argc != 6) return RedisModule_WrongArity(ctx);
     
     long long ts;
     double val;
@@ -93,6 +99,16 @@ int HyAdd_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
         return RedisModule_ReplyWithError(ctx, "ERR invalid value");
     }
 
+    long long retention_ms = 0;
+    if (argc == 6) {
+        size_t len;
+        const char *arg4 = RedisModule_StringPtrLen(argv[4], &len);
+        if (strcasecmp(arg4, "RETENTION") != 0) return RedisModule_ReplyWithError(ctx, "ERR syntax error");
+        if (RedisModule_StringToLongLong(argv[5], &retention_ms) != REDISMODULE_OK || retention_ms < 0) {
+            return RedisModule_ReplyWithError(ctx, "ERR invalid retention");
+        }
+    }
+
     RedisModuleKey *key = RedisModule_OpenKey(ctx, argv[1], REDISMODULE_READ | REDISMODULE_WRITE);
     int type = RedisModule_KeyType(key);
     if (type != REDISMODULE_KEYTYPE_EMPTY && RedisModule_ModuleTypeGetType(key) != HydroType) {
@@ -102,7 +118,7 @@ int HyAdd_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
 
     hydro_ds *ds;
     if (type == REDISMODULE_KEYTYPE_EMPTY) {
-        ds = hydrods_create(1000);
+        ds = hydrods_create(1000, (uint64_t)retention_ms);
         if (!ds) {
             RedisModule_CloseKey(key);
             return RedisModule_ReplyWithError(ctx, "ERR out of memory");
@@ -110,6 +126,9 @@ int HyAdd_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
         RedisModule_ModuleTypeSetValue(key, HydroType, ds);
     } else {
         ds = RedisModule_ModuleTypeGetValue(key);
+        if (argc == 6) {
+            ds->retention_ms = (uint64_t)retention_ms; // Update retention if explicitly specified
+        }
     }
 
     if (hydrods_insert(ds, (uint64_t)ts, val) != 0) {
@@ -149,7 +168,7 @@ int HyMAdd_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc)
 
     hydro_ds *ds;
     if (type == REDISMODULE_KEYTYPE_EMPTY) {
-        ds = hydrods_create(1000);
+        ds = hydrods_create(1000, 0); // Default retention 0 for MADD right now
         if (!ds) {
             RedisModule_CloseKey(key);
             return RedisModule_ReplyWithError(ctx, "ERR out of memory");
@@ -277,7 +296,7 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
         .free = HydroTypeFree
     };
 
-    HydroType = RedisModule_CreateDataType(ctx, "hydro-ts0", 0, &tm);
+    HydroType = RedisModule_CreateDataType(ctx, "hydro-ts0", 1, &tm);
     if (HydroType == NULL) return REDISMODULE_ERR;
 
     if (RedisModule_CreateCommand(ctx, "hy.add", HyAdd_RedisCommand, "write deny-oom", 1, 1, 1) == REDISMODULE_ERR) return REDISMODULE_ERR;
