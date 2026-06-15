@@ -11,7 +11,7 @@ By natively speaking the **Redis Serialization Protocol (RESP)**, HydroDB functi
 * **Redis Compatible:** Speaks the standard RESP protocol. You can use standard `redis-cli` or any Redis Python/Node.js client to talk to it.
 * **Fluid Data Structure:** Dynamically balances data between memory buckets using a "fluid pressure" stabilization algorithm, completely bypassing expensive tree-rebalancing.
 * **Async Disk Persistence:** Every write is asynchronously pushed to an Append Only File (`hydrodb.aof`) via a dedicated background thread, ensuring zero-latency writes with full crash recovery.
-* **Thread Pool Server:** Pre-allocates 250 worker threads to manage incoming client TCP connections via a thread-safe task queue.
+* **Epoll Event Loop / Redis Native:** Originally a standalone C++ non-blocking `epoll` server, HydroDB is now ported into a pure C Redis Module (`hydrodb.so`), inherently benefiting from Redis's world-class single-threaded asynchronous I/O to manage thousands of clients.
 
 ## 🚀 Performance
 Benchmarked against standard Redis using a 64-byte payload for 200,000 queries:

@@ -21,8 +21,7 @@ To prevent Data Corruption while allowing massive concurrency across modern CPU 
 ## 3. 🌐 Networking & Thread Pool (`src/server.cpp`)
 HydroDB speaks raw TCP sockets using the Redis Serialization Protocol (RESP) on port `7379`.
 
-*   **Thread Pool Architecture:** Instead of spawning a new OS thread per connection (which is expensive and crashes at scale), HydroDB pre-allocates a fixed pool of 250 Worker Threads.
-*   **Connection Queue:** The main loop accepts client sockets and pushes them to a synchronized `client_queue`. Worker threads wake up, grab the socket, and process commands seamlessly.
+*   **Epoll Event Loop / Redis Native:** Originally built as a standalone non-blocking `epoll` server, it is now integrated directly into Redis as a Native Module. This means it inherits Redis's incredibly fast, single-threaded event loop architecture to manage thousands of TCP connections with zero context-switching overhead.
 *   **Pipelining & Resilience:** The server handles pipelined bulk commands and explicitly ignores `SIGPIPE` signals, ensuring that sudden client disconnects or pipeline breaks do not crash the engine.
 
 ## 4. 💾 Zero-Latency Disk Persistence (Asynchronous AOF)
