@@ -6,7 +6,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="hydrods",
-    version="2.1.0",
+    version="2.1.1",
     description="The official Python client for HydroDB",
     long_description=long_description,
     long_description_content_type="text/markdown",
