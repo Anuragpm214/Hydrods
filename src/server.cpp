@@ -31,7 +31,8 @@ queue<string> aof_queue;
 condition_variable aof_cv;
 
 // Epoll Client Buffers
-unordered_map<int, string> client_buffers;
+unordered_map<int, string> client_buffers;       // Read buffers (input)
+unordered_map<int, string> client_write_buffers;  // Write buffers (output — EPOLLOUT)
 
 void aof_writer_thread_func() {
     while (true) {
@@ -90,12 +91,60 @@ void log_aof(const string& command) {
     aof_cv.notify_one();
 }
 
-bool process_command(vector<string>& args, int client_sock) {
+// ========================================
+// EPOLLOUT Write Buffering
+// ========================================
+
+// Try to flush write buffer for a client.
+// Returns true if buffer is fully flushed (or was already empty).
+bool try_flush_writes(int client_sock, int epoll_fd) {
+    auto it = client_write_buffers.find(client_sock);
+    if (it == client_write_buffers.end() || it->second.empty()) return true;
+
+    string& wbuf = it->second;
+    while (!wbuf.empty()) {
+        ssize_t ret = write(client_sock, wbuf.c_str(), wbuf.size());
+        if (ret > 0) {
+            wbuf.erase(0, ret);
+        } else if (ret < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Socket buffer full — register EPOLLOUT to resume later
+                struct epoll_event ev;
+                ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
+                ev.data.fd = client_sock;
+                epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client_sock, &ev);
+                return false;
+            }
+            // Real write error
+            return false;
+        } else {
+            break; // ret == 0, shouldn't happen for TCP
+        }
+    }
+
+    // All flushed — switch back to EPOLLIN only
+    if (wbuf.empty()) {
+        struct epoll_event ev;
+        ev.events = EPOLLIN | EPOLLET;
+        ev.data.fd = client_sock;
+        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client_sock, &ev);
+        client_write_buffers.erase(it);
+        return true;
+    }
+    return false;
+}
+
+// ========================================
+// Command Processing
+// ========================================
+
+// Process a command, building the response into `response`.
+// Returns false if the connection should be closed after sending the response.
+bool process_command(vector<string>& args, string& response) {
     if (args.empty()) return true;
     string cmd = args[0];
     for(auto &c : cmd) c = toupper(c);
     
-    string response;
     try {
         if (cmd == "SET") {
             if (args.size() < 3) response = "-ERR wrong number of arguments for 'set' command\r\n";
@@ -103,14 +152,6 @@ bool process_command(vector<string>& args, int client_sock) {
                 db.set(args[1], args[2]);
                 log_aof("SET " + args[1] + " " + args[2]);
                 response = "+OK\r\n";
-            }
-        } else if (cmd == "ZADD") {
-            if (args.size() < 4) response = "-ERR wrong number of arguments for 'zadd' command\r\n";
-            else {
-                string composite_key = args[1] + ":" + args[2];
-                db.set(composite_key, args[3]);
-                log_aof("SET " + composite_key + " " + args[3]);
-                response = ":1\r\n";
             }
         } else if (cmd == "GET") {
             if (args.size() < 2) response = "-ERR wrong number of arguments for 'get' command\r\n";
@@ -126,8 +167,8 @@ bool process_command(vector<string>& args, int client_sock) {
                 if (ok) log_aof("DEL " + args[1]);
                 response = ok ? ":1\r\n" : ":0\r\n";
             }
-        } else if (cmd == "ZRANGE") {
-            if (args.size() < 3) response = "-ERR wrong number of arguments for 'zrange' command\r\n";
+        } else if (cmd == "HRANGE") {
+            if (args.size() < 3) response = "-ERR wrong number of arguments for 'hrange' command\r\n";
             else {
                 string l = args[1], r = args[2];
                 int offset = 0, count = -1;
@@ -140,13 +181,67 @@ bool process_command(vector<string>& args, int client_sock) {
                     }
                 }
                 auto all_res = db.range(l, r, offset, count);
-                ostringstream oss;
-                oss << "*" << (all_res.size() * 2) << "\r\n";
-                for (auto& p : all_res) {
-                    oss << "$" << p.first.size() << "\r\n" << p.first << "\r\n";
-                    oss << "$" << p.second.size() << "\r\n" << p.second << "\r\n";
+
+                // FIX Bug #1: Replace ostringstream with pre-reserved string::append
+                size_t total_size = 16; // header estimate
+                for (const auto& p : all_res) {
+                    total_size += 6 + p.first.size() + 6 + p.second.size();
                 }
-                response = oss.str();
+                response.clear();
+                response.reserve(total_size);
+
+                response += "*";
+                response += to_string(all_res.size() * 2);
+                response += "\r\n";
+                for (const auto& p : all_res) {
+                    response += "$";
+                    response += to_string(p.first.size());
+                    response += "\r\n";
+                    response += p.first;
+                    response += "\r\n";
+                    response += "$";
+                    response += to_string(p.second.size());
+                    response += "\r\n";
+                    response += p.second;
+                    response += "\r\n";
+                }
+            }
+        } else if (cmd == "DBSIZE") {
+            // O(1) count — no need to fetch all elements
+            response = ":" + to_string(db.count()) + "\r\n";
+        } else if (cmd == "HMIN") {
+            // O(1) minimum — reads first element of first bucket
+            auto entry = db.min_entry();
+            if (entry) {
+                response.clear();
+                response += "*2\r\n$";
+                response += to_string(entry->first.size());
+                response += "\r\n";
+                response += entry->first;
+                response += "\r\n$";
+                response += to_string(entry->second.size());
+                response += "\r\n";
+                response += entry->second;
+                response += "\r\n";
+            } else {
+                response = "*0\r\n";
+            }
+        } else if (cmd == "HMAX") {
+            // O(1) maximum — reads last element of last bucket
+            auto entry = db.max_entry();
+            if (entry) {
+                response.clear();
+                response += "*2\r\n$";
+                response += to_string(entry->first.size());
+                response += "\r\n";
+                response += entry->first;
+                response += "\r\n$";
+                response += to_string(entry->second.size());
+                response += "\r\n";
+                response += entry->second;
+                response += "\r\n";
+            } else {
+                response = "*0\r\n";
             }
         } else if (cmd == "PING") {
             response = "+PONG\r\n";
@@ -154,7 +249,6 @@ bool process_command(vector<string>& args, int client_sock) {
             response = "+OK\r\n";
         } else if (cmd == "QUIT") {
             response = "+OK\r\n";
-            int _ = write(client_sock, response.c_str(), response.size()); (void)_;
             return false;
         } else {
             response = "-ERR unknown command '" + cmd + "'\r\n";
@@ -163,13 +257,12 @@ bool process_command(vector<string>& args, int client_sock) {
         response = string("-ERR ") + e.what() + "\r\n";
     }
     
-    // Write directly. In a robust epoll implementation, this would buffer to EPOLLOUT.
-    int ret = write(client_sock, response.c_str(), response.size());
-    if (ret <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-        return false;
-    }
     return true;
 }
+
+// ========================================
+// Client Data Handler
+// ========================================
 
 void handle_client_data(int client_sock, int epoll_fd) {
     char buffer[4096];
@@ -193,8 +286,8 @@ void handle_client_data(int client_sock, int epoll_fd) {
         
         client_buffers[client_sock] += buffer;
         if (client_buffers[client_sock].size() > 1024 * 1024) { 
-            string err = "-ERR command too long\r\n";
-            int _ = write(client_sock, err.c_str(), err.size()); (void)_;
+            client_write_buffers[client_sock] += "-ERR command too long\r\n";
+            try_flush_writes(client_sock, epoll_fd);
             should_close = true;
             break;
         }
@@ -247,7 +340,13 @@ void handle_client_data(int client_sock, int epoll_fd) {
                 if (should_close) break;
                 
                 unparsed_buffer.erase(0, current_pos);
-                if (!process_command(args, client_sock)) {
+
+                // FIX Bug #2: Buffer response instead of writing directly
+                string response;
+                bool keep_alive = process_command(args, response);
+                client_write_buffers[client_sock] += response;
+                if (!keep_alive) {
+                    try_flush_writes(client_sock, epoll_fd);
                     should_close = true;
                 }
             } else {
@@ -266,7 +365,11 @@ void handle_client_data(int client_sock, int epoll_fd) {
                 while (ss >> token) args.push_back(token);
                 
                 if (!args.empty()) {
-                    if (!process_command(args, client_sock)) {
+                    string response;
+                    bool keep_alive = process_command(args, response);
+                    client_write_buffers[client_sock] += response;
+                    if (!keep_alive) {
+                        try_flush_writes(client_sock, epoll_fd);
                         should_close = true;
                     }
                 }
@@ -275,11 +378,17 @@ void handle_client_data(int client_sock, int epoll_fd) {
     } catch (...) {
         should_close = true;
     }
+
+    // Flush all accumulated responses after processing
+    if (!should_close) {
+        try_flush_writes(client_sock, epoll_fd);
+    }
     
     if (should_close) {
         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_sock, nullptr);
         close(client_sock);
         client_buffers.erase(client_sock);
+        client_write_buffers.erase(client_sock);
     }
 }
 
@@ -343,10 +452,13 @@ int main() {
     }
     
     cout << "==============================================" << endl;
-    cout << "  🌊 HydroDB Prototype Server is running!   " << endl;
+    cout << "  🌊 HydroDB Server v1.1 (Optimized)        " << endl;
     cout << "  Listening on TCP port 7379...               " << endl;
-    cout << "  EPOLL Event Loop is ENABLED.                " << endl;
-    cout << "  AOF Persistence is ENABLED.                 " << endl;
+    cout << "  EPOLL Event Loop:   ENABLED                " << endl;
+    cout << "  EPOLLOUT Buffering: ENABLED                " << endl;
+    cout << "  AOF Persistence:    ENABLED                " << endl;
+    cout << "  Commands: SET GET DEL HRANGE PING QUIT     " << endl;
+    cout << "            DBSIZE HMIN HMAX                 " << endl;
     cout << "==============================================" << endl;
     
     const int MAX_EVENTS = 1024;
@@ -375,6 +487,23 @@ int main() {
                     ev.events = EPOLLIN | EPOLLET; // Edge-triggered
                     ev.data.fd = client_sock;
                     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_sock, &ev);
+                }
+            } else if (events[i].events & EPOLLOUT) {
+                // EPOLLOUT fired — resume flushing pending writes
+                int fd = events[i].data.fd;
+                if (!try_flush_writes(fd, epoll_fd)) {
+                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                        // Real write error — close connection
+                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+                        close(fd);
+                        client_buffers.erase(fd);
+                        client_write_buffers.erase(fd);
+                        continue;
+                    }
+                }
+                // Also handle any readable data that arrived
+                if (events[i].events & EPOLLIN) {
+                    handle_client_data(events[i].data.fd, epoll_fd);
                 }
             } else {
                 handle_client_data(events[i].data.fd, epoll_fd);

@@ -36,20 +36,17 @@ class HydroDBEngine {
     mutable std::shared_mutex rw_lock; // Phase 1: Global Reader-Writer Lock
     mutable std::mutex pending_mutex;
     mutable std::condition_variable pending_cv;
-    mutable int pending_writers = 0;
+    mutable std::atomic<int> pending_writers{0};
 
     struct WriterTracker {
         const HydroDBEngine* engine;
         WriterTracker(const HydroDBEngine* e) : engine(e) {
-            std::lock_guard<std::mutex> lk(engine->pending_mutex);
-            engine->pending_writers++;
+            engine->pending_writers.fetch_add(1, std::memory_order_acq_rel);
         }
         ~WriterTracker() {
-            {
-                std::lock_guard<std::mutex> lk(engine->pending_mutex);
-                engine->pending_writers--;
+            if (engine->pending_writers.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                engine->pending_cv.notify_all();
             }
-            engine->pending_cv.notify_all();
         }
     };
 
@@ -175,9 +172,9 @@ public:
 
     // Multi-Threaded Read
     std::optional<Value> get(const Key& k) const {
-        {
+        if (pending_writers.load(std::memory_order_acquire) > 0) {
             std::unique_lock<std::mutex> plock(pending_mutex);
-            pending_cv.wait(plock, [this] { return pending_writers == 0; });
+            pending_cv.wait(plock, [this] { return pending_writers.load(std::memory_order_acquire) == 0; });
         }
         std::shared_lock lock(rw_lock); // Concurrent Read Lock
         
@@ -202,7 +199,7 @@ public:
         auto &B = buckets[i];
         
         auto it = std::lower_bound(B.begin(), B.end(), k, comp);
-        if (it == B.end() || k < it->key) return false; 
+        if (it == B.end() || k < it->key || it->key < k) return false;
 
         B.erase(it);
         elements_count--;
@@ -226,9 +223,9 @@ public:
 
     // Multi-Threaded Range Query
     std::vector<std::pair<Key, Value>> range(const Key& L, const Key& R, int offset = 0, int count = -1) const {
-        {
+        if (pending_writers.load(std::memory_order_acquire) > 0) {
             std::unique_lock<std::mutex> plock(pending_mutex);
-            pending_cv.wait(plock, [this] { return pending_writers == 0; });
+            pending_cv.wait(plock, [this] { return pending_writers.load(std::memory_order_acquire) == 0; });
         }
         std::shared_lock lock(rw_lock); // Concurrent Read Lock
         std::vector<std::pair<Key, Value>> result;
@@ -254,5 +251,34 @@ public:
             }
         }
         return result;
+    }
+    // O(1) element count
+    std::size_t count() const {
+        std::shared_lock lock(rw_lock);
+        return elements_count;
+    }
+
+    // O(1) minimum entry (first element of first bucket)
+    std::optional<std::pair<Key, Value>> min_entry() const {
+        if (pending_writers.load(std::memory_order_acquire) > 0) {
+            std::unique_lock<std::mutex> plock(pending_mutex);
+            pending_cv.wait(plock, [this] { return pending_writers.load(std::memory_order_acquire) == 0; });
+        }
+        std::shared_lock lock(rw_lock);
+        if (buckets.empty()) return std::nullopt;
+        const auto& front = buckets.front().front();
+        return std::make_pair(front.key, front.value);
+    }
+
+    // O(1) maximum entry (last element of last bucket)
+    std::optional<std::pair<Key, Value>> max_entry() const {
+        if (pending_writers.load(std::memory_order_acquire) > 0) {
+            std::unique_lock<std::mutex> plock(pending_mutex);
+            pending_cv.wait(plock, [this] { return pending_writers.load(std::memory_order_acquire) == 0; });
+        }
+        std::shared_lock lock(rw_lock);
+        if (buckets.empty()) return std::nullopt;
+        const auto& back = buckets.back().back();
+        return std::make_pair(back.key, back.value);
     }
 };

@@ -98,8 +98,8 @@ class HydroDB:
         return bool(self._parse_response())
 
     def range(self, start_key, end_key, limit=None, offset=0):
-        """Return all key-value pairs between start_key and end_key."""
-        cmd = f"ZRANGE {start_key} {end_key}"
+        """Return all key-value pairs between start_key and end_key (lexicographic)."""
+        cmd = f"HRANGE {start_key} {end_key}"
         if limit is not None:
             cmd += f" LIMIT {offset} {limit}"
             
